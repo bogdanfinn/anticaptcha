@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	hcpatcha "github.com/bogdanfinn/anticaptcha/hcaptcha"
+	"github.com/bogdanfinn/anticaptcha/image"
+	"github.com/bogdanfinn/anticaptcha/recaptcha"
 	"net/http"
 	"net/url"
 	"time"
@@ -15,55 +18,34 @@ var (
 	checkInterval = 2 * time.Second
 )
 
-type Client struct {
-	APIKey string
+type Client interface {
+	SolveRecaptcha(websiteURL string, recaptchaKey string, proxy string, userAgent string) (string, error)
+	SolveHcaptcha(websiteURL string, siteKey string, proxy string, userAgent string) (string, error)
+	GetBalance() (float64, error)
+	SolveImage(imgString string) (string, error)
 }
 
-// Method to create the task to process the recaptcha, returns the task_id
-func (c *Client) createTaskRecaptcha(websiteURL string, recaptchaKey string) (float64, error) {
-	// Mount the data to be sent
-	body := map[string]interface{}{
-		"clientKey": c.APIKey,
-		"task": map[string]interface{}{
-			"type":       "NoCaptchaTaskProxyless",
-			"websiteURL": websiteURL,
-			"websiteKey": recaptchaKey,
-		},
-	}
-
-	b, err := json.Marshal(body)
-	if err != nil {
-		return 0, err
-	}
-
-	// Make the request
-	u := baseURL.ResolveReference(&url.URL{Path: "/createTask"})
-	resp, err := http.Post(u.String(), "application/json", bytes.NewBuffer(b))
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
-	// Decode response
-	responseBody := make(map[string]interface{})
-	json.NewDecoder(resp.Body).Decode(&responseBody)
-	// TODO treat api errors and handle them properly
-	if _, ok := responseBody["taskId"]; ok {
-		if taskId, ok := responseBody["taskId"].(float64); ok {
-			return taskId, nil
-		}
-
-		return 0, errors.New("task number of irregular format")
-	}
-
-	return 0, errors.New("task number not found in server response")
+type client struct {
+	apiKey          string
+	timeoutInterval time.Duration
+	recaptchaClient recaptcha.RecaptchaClient
+	imageClient     image.ImageClient
+	hcaptchaClient  hcpatcha.HcaptchaClient
 }
 
-// Method to check the result of a given task, returns the json returned from the api
-func (c *Client) getTaskResult(taskID float64) (map[string]interface{}, error) {
-	// Mount the data to be sent
+func NewClient(apiKey string, timeoutInterval time.Duration) Client {
+	return &client{
+		apiKey:          apiKey,
+		timeoutInterval: timeoutInterval,
+		recaptchaClient: recaptcha.NewRecaptchaClient(apiKey, baseURL),
+		imageClient:     image.NewImageClient(apiKey, baseURL),
+		hcaptchaClient:  hcpatcha.NewHcaptchaClient(apiKey, baseURL),
+	}
+}
+
+func (c *client) getTaskResult(taskID float64) (map[string]interface{}, error) {
 	body := map[string]interface{}{
-		"clientKey": c.APIKey,
+		"clientKey": c.apiKey,
 		"taskId":    taskID,
 	}
 	b, err := json.Marshal(body)
@@ -71,7 +53,6 @@ func (c *Client) getTaskResult(taskID float64) (map[string]interface{}, error) {
 		return nil, err
 	}
 
-	// Make the request
 	u := baseURL.ResolveReference(&url.URL{Path: "/getTaskResult"})
 	resp, err := http.Post(u.String(), "application/json", bytes.NewBuffer(b))
 	if err != nil {
@@ -79,23 +60,27 @@ func (c *Client) getTaskResult(taskID float64) (map[string]interface{}, error) {
 	}
 	defer resp.Body.Close()
 
-	// Decode response
 	responseBody := make(map[string]interface{})
 	json.NewDecoder(resp.Body).Decode(&responseBody)
 	return responseBody, nil
 }
 
-// SendRecaptcha Method to encapsulate the processing of the recaptcha
-// Given a url and a key, it sends to the api and waits until
-// the processing is complete to return the evaluated key
-func (c *Client) SendRecaptcha(websiteURL string, recaptchaKey string, timeoutInterval time.Duration) (string, error) {
-	taskID, err := c.createTaskRecaptcha(websiteURL, recaptchaKey)
+func (c *client) SolveRecaptcha(websiteURL string, recaptchaKey string, proxy string, userAgent string) (string, error) {
+	var taskID float64
+	var err error
+
+	if proxy == "" {
+		taskID, err = c.recaptchaClient.CreateTaskRecaptchaProxyless(websiteURL, recaptchaKey)
+	} else {
+		taskID, err = c.recaptchaClient.CreateTaskRecaptcha(websiteURL, recaptchaKey, proxy, userAgent)
+	}
+
 	if err != nil {
 		return "", err
 	}
 
 	check := time.NewTicker(10 * time.Second)
-	timeout := time.NewTimer(timeoutInterval)
+	timeout := time.NewTimer(c.timeoutInterval)
 
 	for {
 		select {
@@ -114,57 +99,22 @@ func (c *Client) SendRecaptcha(websiteURL string, recaptchaKey string, timeoutIn
 	}
 }
 
+func (c *client) SolveHcaptcha(websiteURL string, siteKey string, proxy string, userAgent string) (string, error) {
+	var taskID float64
+	var err error
 
-// Method to create the task to process the hcaptcha, returns the task_id
-func (c *Client) createTaskHcaptcha(websiteURL string, siteKey string) (float64, error) {
-	// Mount the data to be sent
-	body := map[string]interface{}{
-		"clientKey": c.APIKey,
-		"task": map[string]interface{}{
-			"type":       "HCaptchaTask",
-			"websiteURL": websiteURL,
-			"websiteKey": siteKey,
-		},
+	if proxy == "" {
+		taskID, err = c.hcaptchaClient.CreateTaskHcaptchaProxyless(websiteURL, siteKey)
+	} else {
+		taskID, err = c.hcaptchaClient.CreateTaskHcaptcha(websiteURL, siteKey, proxy, userAgent)
 	}
 
-	b, err := json.Marshal(body)
-	if err != nil {
-		return 0, err
-	}
-
-	// Make the request
-	u := baseURL.ResolveReference(&url.URL{Path: "/createTask"})
-	resp, err := http.Post(u.String(), "application/json", bytes.NewBuffer(b))
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
-	// Decode response
-	responseBody := make(map[string]interface{})
-	json.NewDecoder(resp.Body).Decode(&responseBody)
-	if _, ok := responseBody["taskId"]; ok {
-		if taskId, ok := responseBody["taskId"].(float64); ok {
-			return taskId, nil
-		}
-
-		return 0, errors.New("task number of irregular format")
-	}
-
-	return 0, errors.New("task number not found in server response")
-}
-
-// SendHcaptcha Method to encapsulate the processing of the hCaptcha
-// Given a url and a key, it sends to the api and waits until
-// the processing is complete to return the evaluated key
-func (c *Client) SendHcaptcha(websiteURL string, siteKey string, timeoutInterval time.Duration) (string, error) {
-	taskID, err := c.createTaskHcaptcha(websiteURL, siteKey)
 	if err != nil {
 		return "", err
 	}
 
 	check := time.NewTicker(10 * time.Second)
-	timeout := time.NewTimer(timeoutInterval)
+	timeout := time.NewTimer(c.timeoutInterval)
 
 	for {
 		select {
@@ -183,53 +133,9 @@ func (c *Client) SendHcaptcha(websiteURL string, siteKey string, timeoutInterval
 	}
 }
 
-// Method to create the task to process the image captcha, returns the task_id
-func (c *Client) createTaskImage(imgString string) (float64, error) {
-	// Mount the data to be sent
-	body := map[string]interface{}{
-		"clientKey": c.APIKey,
-		"task": map[string]interface{}{
-			"type": "ImageToTextTask",
-			"body": imgString,
-		},
-	}
-
-	b, err := json.Marshal(body)
-	if err != nil {
-		return 0, err
-	}
-
-	// Make the request
-	u := baseURL.ResolveReference(&url.URL{Path: "/createTask"})
-	resp, err := http.Post(u.String(), "application/json", bytes.NewBuffer(b))
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
-	// Decode response
-	responseBody := make(map[string]interface{})
-	json.NewDecoder(resp.Body).Decode(&responseBody)
-
-	errorDescription, ok := responseBody["errorDescription"]
-	if ok {
-		return 0, fmt.Errorf("server returned: %s", errorDescription)
-	}
-
-	taskId, ok := responseBody["taskId"]
-	if !ok {
-		return 0, errors.New("failed to get a response")
-	}
-
-	return taskId.(float64), nil
-}
-
-// SendImage Method to encapsulate the processing of the image captcha
-// Given a base64 string from the image, it sends to the api and waits until
-// the processing is complete to return the evaluated key
-func (c *Client) SendImage(imgString string) (string, error) {
+func (c *client) SolveImage(imgString string) (string, error) {
 	// Create the task on anti-captcha api and get the task_id
-	taskID, err := c.createTaskImage(imgString)
+	taskID, err := c.imageClient.CreateTaskImage(imgString)
 	if err != nil {
 		return "", err
 	}
@@ -264,18 +170,15 @@ func (c *Client) SendImage(imgString string) (string, error) {
 	return solution.(map[string]interface{})["text"].(string), nil
 }
 
-// GetBalance Method to get current account balance
-func (c *Client) GetBalance() (float64, error) {
-	// Mount the data to be sent
+func (c *client) GetBalance() (float64, error) {
 	body := map[string]interface{}{
-		"clientKey": c.APIKey}
+		"clientKey": c.apiKey}
 
 	b, err := json.Marshal(body)
 	if err != nil {
 		return -1, err
 	}
 
-	// Make the request
 	u := baseURL.ResolveReference(&url.URL{Path: "/getBalance"})
 	resp, err := http.Post(u.String(), "application/json", bytes.NewBuffer(b))
 	if err != nil {
@@ -283,7 +186,6 @@ func (c *Client) GetBalance() (float64, error) {
 	}
 	defer resp.Body.Close()
 
-	// Decode response
 	responseBody := make(map[string]interface{})
 	json.NewDecoder(resp.Body).Decode(&responseBody)
 
